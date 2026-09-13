@@ -92,6 +92,7 @@ func NewRootCmd() *cobra.Command {
 
 	root.AddCommand(
 		newVideoCmd(g),
+		newCommentsCmd(g),
 		newLoginCmd(g),
 		newLogoutCmd(g),
 		newWhoamiCmd(g),

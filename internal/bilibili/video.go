@@ -55,7 +55,7 @@ func (r *apiVideoView) toModel() *model.Video {
 		Desc:     r.Desc,
 		Cover:    r.Pic,
 		Up:       model.User{Mid: r.Owner.Mid, Name: r.Owner.Name, Avatar: r.Owner.Face},
-		PubTime:  time.Unix(r.Pubdate, 0),
+		PubTime:  model.Time(time.Unix(r.Pubdate, 0)),
 		Duration: r.Duration,
 		Stat: model.Stats{
 			View:     r.Stat.View,
@@ -66,7 +66,7 @@ func (r *apiVideoView) toModel() *model.Video {
 			Share:    r.Stat.Share,
 			Like:     r.Stat.Like,
 		},
-		FetchedAt: time.Now(),
+		FetchedAt: model.Time(time.Now()),
 	}
 	for _, p := range r.Pages {
 		v.Pages = append(v.Pages, model.Page{

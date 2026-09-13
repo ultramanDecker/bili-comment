@@ -443,3 +443,29 @@ type Comment struct {
 
 登录态落盘在 `os.UserConfigDir()/bili-comment/config.json`，权限 0600。
 它等同于账号凭据：不要提交到版本库，不要分享。
+
+### M3
+
+| 项 | 结论 |
+|---|---|
+| 游标路径 | `data.cursor.pagination_reply.next_offset`，请求时放进 `pagination_str={"offset":"<cursor>"}`。首次请求传空串 |
+| 每页条数 | 20 条 |
+| 总数 | `data.cursor.all_count`，是**一级评论 + 楼中楼**的合计，比一级评论实际条数大 |
+| 结束标志 | `data.cursor.is_end`。**不能只看它**——见下面「未登录」一行 |
+| 未登录的截断 | 对一条 `all_count=232702` 的视频，未登录请求返回 **3 条** `replies` 且 `is_end=true`。服务端不报错、不降级，就是静默少给。这是本项目最危险的一个坑：看起来完全像「这视频没人评论」 |
+| `member.mid` 的类型 | `member.mid` 是**字符串**，而同一条回复外层的 `mid` 是**数字**。同一个接口两种写法，写死任一种都会在另一种出现时解析失败（`flexID` 类型就是为此存在） |
+| `count` vs `rcount` | 回复数在两个字段里都给，实测相等。取较大值，免得其中一个缺失时把「漏了多少条」报小了 |
+| 置顶评论 | 有时只在 `top_replies` 里、不在 `replies` 中，按 `rpid` 去重后补进首页 |
+| `reply_control.location` | 较老的评论没有这个字段（实测 40 条样本中只有 4 条有）。IP 属地是后加的功能，历史数据为空 |
+| `vip.vipType` vs `vipStatus` | `vipType=1` 而 `vipStatus=0` 是会员已过期，网页端不显示大会员标记。以 `vipStatus` 为准 |
+| 单种排序的上限 | 每个 `mode` 约 5000 条封顶，突破需要双排序合并（推迟到 M6） |
+
+**游标卡死防护。** 分页循环里有一条容易被当成多余的检查：服务端把下一页游标指回
+当前游标时立即停止并记为 `cursor_stuck`。没有这条，一个服务端的异常响应就会变成
+无限循环发请求——在 2.5 秒间隔下不会立刻暴露，而是安静地跑几十分钟后撞上风控。
+
+**验证方式。** 分页逻辑抽成了 `pageFetcher` 函数类型，边界条件（limit 落在页中间、
+limit 落在页边界、`--since` 截止、游标卡死、回调报错、请求报错时的部分结果）
+全部用假 fetcher 覆盖，不依赖网络。真实链路的验证是
+`bili comments BV1GJ411x7h7 --limit 40`：42 行输出，40 个唯一 `rpid`，2 页，
+`summary` 为 `{"expected":232702,"fetched":40,"pages":2,"reason":"limit","truncated":true}`。

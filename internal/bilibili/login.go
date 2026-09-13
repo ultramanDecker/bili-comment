@@ -191,11 +191,11 @@ func (c *Client) WhoAmI(ctx context.Context) (*Account, error) {
 		return nil, err
 	}
 	var r struct {
-		IsLogin   bool    `json:"isLogin"`
-		Mid       int64   `json:"mid"`
-		Uname     string  `json:"uname"`
-		Face      string  `json:"face"`
-		VipStatus int     `json:"vipStatus"`
+		IsLogin   bool   `json:"isLogin"`
+		Mid       int64  `json:"mid"`
+		Uname     string `json:"uname"`
+		Face      string `json:"face"`
+		VipStatus int    `json:"vipStatus"`
 		LevelInfo struct {
 			CurrentLevel int `json:"current_level"`
 		} `json:"level_info"`

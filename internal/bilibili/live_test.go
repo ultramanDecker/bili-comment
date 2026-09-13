@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ultramanDecker/bili-comment/internal/config"
 )
 
 // 联网冒烟测试，默认跳过。启用方式：
@@ -25,10 +27,20 @@ func liveClient(t *testing.T) *Client {
 	if os.Getenv("BILI_LIVE") == "" {
 		t.Skip("跳过联网测试（设置 BILI_LIVE=1 启用）")
 	}
+	// 带上本地登录态：未登录时服务端会把评论列表截断成几条，
+	// 测试跑在未登录状态下就验证不到真实行为。
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("读取配置失败：%v", err)
+	}
+	if cfg.Cookies["SESSDATA"] == "" {
+		t.Log("提示：未检测到登录态，评论相关的断言可能因服务端截断而失真")
+	}
 	// 请求间隔取保守值，避免因为跑测试把自己送进风控。
 	return NewClient(Options{
-		Delay: 3 * time.Second,
-		Logf:  func(format string, args ...any) { t.Logf(format, args...) },
+		Delay:   3 * time.Second,
+		Cookies: cfg.Cookies,
+		Logf:    func(format string, args ...any) { t.Logf(format, args...) },
 	})
 }
 
