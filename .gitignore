@@ -1,0 +1,14 @@
+# 构建产物
+/bili
+/bili.exe
+/dist/
+
+# 抓取输出
+/data/
+dataset/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,8 @@
+# 统一按 LF 存入仓库。没有这一条时，git 会把 Windows 贡献者提交的 CRLF
+# 原样存进去，与 Linux 贡献者的 LF 混在一起，diff 里全是无意义的整行变更。
+* text=auto eol=lf
+
+# 二进制文件不做换行转换。
+*.png binary
+*.jpg binary
+*.ico binary
