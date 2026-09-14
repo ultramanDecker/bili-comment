@@ -42,8 +42,20 @@ type Journal struct {
 	BVID    string `json:"bvid,omitempty"`
 	Phase   Phase  `json:"phase"`
 
-	// Offset 是输出文件中已确认完整的字节数。续传时先截断到这里。
-	Offset int64 `json:"offset"`
+	// Primary 是主输出的格式名。进度文件挂在主输出上，续传时先把它截断到
+	// Offsets[Primary]，那半栋楼就被干净地丢掉了。
+	Primary string `json:"primary,omitempty"`
+
+	// Offsets 是每种输出格式各自已确认完整的字节数。续传时逐个截断到这里。
+	//
+	// 为什么要每种格式各存一个：同一批记录在不同格式下的字节长度完全不同
+	// （一条评论在 JSONL 里约 300 字节，在 TSV 里约 120），而续传要求
+	// 「每个文件都停在同一条记录的边界上」。共用一个位置做不到这件事。
+	Offsets map[string]int64 `json:"offsets,omitempty"`
+
+	// Formats 是本次输出涉及的格式名。续传时它必须与上次完全一致：
+	// 集合变了，Offsets 里的位置就找不到对应的文件了。
+	Formats []string `json:"formats,omitempty"`
 
 	// RootCursor 仅 PhaseRoots 有意义：一级评论下一页的游标。
 	// 有了它，一级评论阶段中断后不必从头重抓。
@@ -90,6 +102,49 @@ type Journal struct {
 	StubsWritten bool `json:"stubs_written,omitempty"`
 
 	UpdatedAt string `json:"updated_at"`
+}
+
+// FormatDiff 是两个输出格式集合的差异。
+//
+// 它存在的理由只有一个：续传的正确性依赖「上次写了哪些文件」与「这次要写哪些
+// 文件」完全一致。少了任何一个，那个文件就会接在半截数据后面继续写；
+// 多了任何一个，它没有可截断的位置，只能从头写——而文件里已经有别的东西了。
+type FormatDiff struct {
+	Added   []string // 本次要输出、但进度文件里没有的
+	Removed []string // 进度文件里有、但本次不输出的
+}
+
+// Empty 表示两个集合一致，续传可以继续。
+func (d FormatDiff) Empty() bool { return len(d.Added) == 0 && len(d.Removed) == 0 }
+
+// DiffFormats 比较进度文件记录的格式集合与本次的格式集合。
+//
+// recorded 为空表示这是早期版本留下的进度文件（那时还没有多格式输出），
+// 此时返回空差异——按现状接受，否则所有老进度文件都会突然无法续传。
+func DiffFormats(recorded, planned []string) FormatDiff {
+	if len(recorded) == 0 {
+		return FormatDiff{}
+	}
+	var d FormatDiff
+	has := func(list []string, s string) bool {
+		for _, v := range list {
+			if v == s {
+				return true
+			}
+		}
+		return false
+	}
+	for _, n := range planned {
+		if !has(recorded, n) {
+			d.Added = append(d.Added, n)
+		}
+	}
+	for _, n := range recorded {
+		if !has(planned, n) {
+			d.Removed = append(d.Removed, n)
+		}
+	}
+	return d
 }
 
 // ErrNoJournal 表示没有找到进度文件，调用方应开始一次全新的抓取。

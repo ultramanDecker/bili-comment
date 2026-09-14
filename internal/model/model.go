@@ -78,6 +78,12 @@ type Comment struct {
 
 	Location string `json:"location,omitempty"` // IP 属地，老评论没有这个字段
 
+	// Rel 是相对视频发布时间的说法（「3小时」「2年」），由 annotate 包算出。
+	//
+	// 放在模型里而不是留给输出层现算，是因为它要出现在每一种格式里，
+	// 而输出层拿不到视频发布时间之外的东西——它的每一条记录都是独立的。
+	Rel string `json:"rel,omitempty"`
+
 	Emotes   map[string]string `json:"emotes,omitempty"`   // 表情名 → 图片地址
 	Pictures []string          `json:"pictures,omitempty"` // 评论配图
 

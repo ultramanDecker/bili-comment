@@ -14,6 +14,13 @@ import (
 	"github.com/ultramanDecker/bili-comment/internal/config"
 )
 
+// Version 是程序版本号。
+//
+// 默认 "dev"，发布时用 -ldflags "-X .../internal/cli.Version=v0.1.0" 注入。
+// 它会写进数据集的 manifest.json——一份数据在被生成几个月后，
+// 「当时用的是哪个版本」是复现问题的第一个线索。
+var Version = "dev"
+
 // ExitCode 是设计文档约定的退出码，便于脚本批量调用时判断。
 const (
 	ExitOK        = 0

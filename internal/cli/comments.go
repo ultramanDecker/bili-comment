@@ -9,22 +9,27 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/ultramanDecker/bili-comment/internal/annotate"
 	"github.com/ultramanDecker/bili-comment/internal/bilibili"
 	"github.com/ultramanDecker/bili-comment/internal/model"
+	"github.com/ultramanDecker/bili-comment/internal/output"
 	"github.com/ultramanDecker/bili-comment/internal/store"
 )
 
 func newCommentsCmd(g *globals) *cobra.Command {
 	var (
-		out   string
-		limit int
-		mode  string
-		since string
-		full  bool
+		out    string
+		format []string
+		limit  int
+		mode   string
+		since  string
+		full   bool
 
 		noReplies        bool
 		repliesTop       int
@@ -71,7 +76,7 @@ root 是所属一级评论，parent 是被直接回复的那条评论。
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runComments(cmd, g, args[0], commentsFlags{
-				out: out, limit: limit, mode: mode, since: since, full: full,
+				out: out, format: format, limit: limit, mode: mode, since: since, full: full,
 				policy: bilibili.ReplyPolicy{
 					Disabled:   noReplies,
 					Top:        repliesTop,
@@ -87,7 +92,9 @@ root 是所属一级评论，parent 是被直接回复的那条评论。
 	}
 
 	fl := cmd.Flags()
-	fl.StringVarP(&out, "out", "o", "", "写入文件而非打印到 stdout")
+	fl.StringVarP(&out, "out", "o", "", "写入文件或目录，默认打印到 stdout")
+	fl.StringSliceVar(&format, "format", nil,
+		"额外输出这些格式（可重复或用逗号分隔）："+strings.Join(output.Names(), "、"))
 	fl.IntVar(&limit, "limit", 0, "最多抓取多少条一级评论，0 表示不限")
 	fl.StringVar(&mode, "mode", "hot", "排序方式：hot（热度）或 time（时间）")
 	fl.StringVar(&since, "since", "", "只抓该日期之后的评论（YYYY-MM-DD），需配合 --mode time")
@@ -108,6 +115,7 @@ root 是所属一级评论，parent 是被直接回复的那条评论。
 
 type commentsFlags struct {
 	out         string
+	format      []string
 	limit       int
 	mode        string
 	since       string
@@ -178,9 +186,9 @@ func runComments(cmd *cobra.Command, g *globals, input string, f commentsFlags) 
 
 	// ---- 阶段一：一级评论 ----
 
-	roots, resumeIndex, err := phaseRoots(ctx, g, c, out, f, video, commentMode, since, cmd)
+	roots, resumeIndex, err := phaseRoots(ctx, g, c, out, f, video, commentMode, since)
 	if err != nil {
-		out.writeSummary(summary{Type: "summary", Reason: "error", Error: err.Error()})
+		out.writeSummary(&output.Summary{Type: "summary", Reason: "error", Error: err.Error()})
 		return err
 	}
 
@@ -193,7 +201,7 @@ func runComments(cmd *cobra.Command, g *globals, input string, f commentsFlags) 
 
 	rep, err := phaseReplies(ctx, g, c, out, f, video, plan, resumeIndex)
 	if err != nil {
-		out.writeSummary(summary{
+		out.writeSummary(&output.Summary{
 			Type: "summary", Reason: "error", Error: err.Error(), Replies: rep,
 		})
 		return err
@@ -201,7 +209,7 @@ func runComments(cmd *cobra.Command, g *globals, input string, f commentsFlags) 
 
 	// ---- 收尾 ----
 
-	out.writeSummary(summary{
+	out.writeSummary(&output.Summary{
 		Type:      "summary",
 		Expected:  out.rootExpected,
 		Fetched:   out.rootFetched,
@@ -214,13 +222,24 @@ func runComments(cmd *cobra.Command, g *globals, input string, f commentsFlags) 
 		return err
 	}
 
+	// ---- 数据集附带文件 ----
+	//
+	// 放在进度文件清理之前：这几份是从已完成的主输出推导出来的，
+	// 需要主输出是完整的。它们写失败不该让整次抓取算失败——
+	// 评论数据本身已经好好地躺在文件里了，那才是用户要的东西。
+	if out.dir != "" {
+		if err := writeDatasetExtras(out, video, f.mode); err != nil {
+			g.logf("警告：生成数据集附带文件失败：%v", err)
+		}
+	}
+
 	// 只有完整跑完才删进度文件。中途出错时留着，下次才能续。
-	if f.out != "" {
-		if err := store.Remove(f.out); err != nil {
+	if out.persistent() {
+		if err := store.Remove(out.journalPath); err != nil {
 			g.logf("警告：清理进度文件失败：%v", err)
 		}
 	}
-	reportFetch(g, f.out, out)
+	reportFetch(g, out)
 	return nil
 }
 
@@ -228,15 +247,19 @@ func runComments(cmd *cobra.Command, g *globals, input string, f commentsFlags) 
 func phaseRoots(
 	ctx context.Context, g *globals, c *bilibili.Client, out *sink,
 	f commentsFlags, video *model.Video, commentMode bilibili.CommentMode,
-	since time.Time, cmd *cobra.Command,
+	since time.Time,
 ) ([]*model.Comment, int, error) {
 	// 一级评论阶段已经完成：文件里就有全部一级评论，读回来重建计划即可，
 	// 不必为了算计划再抓一遍。
 	if out.resuming && out.journal.Phase == store.PhaseReplies {
-		roots, err := readRootsFrom(out.path)
+		roots, err := readRootsFrom(out.primary.path)
 		if err != nil {
 			return nil, 0, err
 		}
+		// 续传时把已经写进文件的那部分喂回复读索引。
+		// 不这么做的话，断点之后的评论只会跟断点之后的评论比，
+		// 前缀里的复读源就漏掉了。
+		seedCollector(out, out.primary.path, out.primary.n)
 		// 一级评论这次一条都没抓，但文件里有。收尾提示和 summary 行描述的是
 		// 文件而不是本次运行，所以把上次定稿的统计取回来，
 		// 否则会写出 fetched=0 而这种话——与文件内容直接矛盾。
@@ -253,21 +276,8 @@ func phaseRoots(
 	if out.resuming {
 		startCursor = out.journal.RootCursor
 		g.logf("续传：一级评论从断点继续，已有 %d 条", out.rootFetched)
-	} else {
-		if err := out.writeHeader(header{
-			Type:      "video",
-			BVID:      video.BVID,
-			AID:       video.AID,
-			Title:     video.Title,
-			UpMid:     video.Up.Mid,
-			UpName:    video.Up.Name,
-			PubTime:   video.PubTime,
-			StatReply: video.Stat.Reply,
-			Mode:      commentMode.String(),
-			FetchedAt: model.Time(time.Now()),
-		}); err != nil {
-			return nil, 0, err
-		}
+		// 把前缀喂回复读索引，理由同上面一级评论已抓完的那条分支。
+		seedCollector(out, out.primary.path, out.primary.n)
 	}
 
 	if !out.resuming {
@@ -288,9 +298,6 @@ func phaseRoots(
 		UpMid: video.Up.Mid,
 	}, startCursor, func(page []*model.Comment, cur bilibili.Cursor) error {
 		for _, cm := range page {
-			if !f.full {
-				trimForLLM(cm)
-			}
 			if err := out.writeComment(cm); err != nil {
 				return err
 			}
@@ -303,14 +310,13 @@ func phaseRoots(
 		// 进度只在这里推进：上面已经 Flush，Offset 指向的字节确实在磁盘上了。
 		// 顺序反过来就会记录一个比实际内容更靠后的位置，续传时截断出空洞。
 		out.rootFetched += len(page)
-		if f.out == "" {
+		if !out.persistent() {
 			return nil
 		}
 		out.journal.Phase = store.PhaseRoots
-		out.journal.Offset = out.n
 		out.journal.RootCursor = cur.NextOffset
 		g.logf("已抓取 %d 条一级评论", out.rootFetched)
-		return out.journal.Save(f.out)
+		return out.saveJournal()
 	})
 	if err != nil {
 		return roots, 0, err
@@ -321,13 +327,12 @@ func phaseRoots(
 	out.rootStopped = res.Stopped
 	out.rootTruncated = res.Truncated
 
-	if f.out != "" {
+	if out.persistent() {
 		// 一级评论阶段完成，进度切到楼中楼阶段。此时 RootCursor 不再有意义，
 		// 要清掉，否则下次误以为还能从游标续抓。
 		out.journal.Phase = store.PhaseReplies
 		out.journal.RootCursor = ""
 		out.journal.PlanIndex = 0
-		out.journal.Offset = out.n
 		out.journal.PolicyHash = f.policy.Fingerprint()
 		// 一级评论的统计在这里定稿。之后即便续传时不再重抓一级评论，
 		// summary 与收尾提示也要靠它们说话，所以必须落盘。
@@ -336,7 +341,7 @@ func phaseRoots(
 		out.journal.RootPages = res.Pages
 		out.journal.RootStopped = string(res.Stopped)
 		out.journal.RootTruncated = res.Truncated
-		if err := out.journal.Save(f.out); err != nil {
+		if err := out.saveJournal(); err != nil {
 			return roots, 0, err
 		}
 	}
@@ -347,15 +352,21 @@ func phaseRoots(
 func phaseReplies(
 	ctx context.Context, g *globals, c *bilibili.Client, out *sink,
 	f commentsFlags, video *model.Video, plan *bilibili.ReplyPlan, startIndex int,
-) (*replySummary, error) {
-	rep := &replySummary{
+) (*output.ReplySummary, error) {
+	rep := &output.ReplySummary{
 		RootsWithReplies: countRootsWithReplies(plan),
 		Skipped:          plan.StubCount(),
 		Reasons:          map[string]int{},
 	}
 	for _, it := range plan.Items {
-		if !it.Expand && it.Skip != bilibili.SkipNoReplies {
+		if !it.Expand {
+			// 本来就没有回复的楼不算「漏了东西」，它没有东西可漏。
+			// 算进去会让「跳过 17 栋」这个数字虚高，掩盖真正被策略裁掉的部分。
+			if it.Skip == bilibili.SkipNoReplies {
+				continue
+			}
 			rep.Reasons[string(it.Skip)]++
+			rep.SkippedReplies += it.ReplyCount
 		}
 	}
 
@@ -391,7 +402,7 @@ func phaseReplies(
 			if it.Expand || it.Skip == bilibili.SkipNoReplies {
 				continue
 			}
-			if err := out.writeStub(stub{
+			if err := out.writeStub(&output.Stub{
 				Type:       "reply_stub",
 				Rpid:       it.Root,
 				ReplyCount: it.ReplyCount,
@@ -404,10 +415,9 @@ func phaseReplies(
 		if err := out.Flush(); err != nil {
 			return rep, err
 		}
-		if f.out != "" {
+		if out.persistent() {
 			out.journal.StubsWritten = true
-			out.journal.Offset = out.n
-			if err := out.journal.Save(f.out); err != nil {
+			if err := out.saveJournal(); err != nil {
 				return rep, err
 			}
 		}
@@ -448,9 +458,6 @@ func phaseReplies(
 		},
 		func(i int, rr rootReplies) error {
 			for _, cm := range rr.comments {
-				if !f.full {
-					trimForLLM(cm)
-				}
 				if err := out.writeComment(cm); err != nil {
 					return err
 				}
@@ -478,14 +485,13 @@ func phaseReplies(
 			// 累计量与 Offset 必须在同一次 Save 里落盘：它们描述的是同一个
 			// 时刻的文件内容，分两次写就可能出现「偏移对得上、数字对不上」
 			// 的中间态，续传读到的 summary 就是假的。
-			if f.out != "" {
+			if out.persistent() {
 				out.journal.PlanIndex = idx + 1
-				out.journal.Offset = out.n
 				out.journal.ReplyFetched = rep.Fetched
 				out.journal.ReplyExpected = rep.Expected
 				out.journal.ReplyOffsetLimited = rep.OffsetLimited
 				out.journal.ReplyTruncated = rep.Truncated
-				if err := out.journal.Save(f.out); err != nil {
+				if err := out.saveJournal(); err != nil {
 					return err
 				}
 			}
@@ -564,22 +570,207 @@ func readRootsFrom(path string) ([]*model.Comment, error) {
 	return roots, nil
 }
 
+// seedCollector 把已经写进文件的那部分评论喂回复读索引。
+//
+// 续传时索引必须接着上次的用，否则断点之后的评论只会与断点之后的评论比，
+// 前缀里的复读源就漏掉了——表现是「同一条复读，前半段标了后半段没标」，
+// 而这种不一致在文件里看不出来，只会让下游以为后半段是干净的。
+//
+// 代价是重跑一遍前缀的 SimHash，几十万条评论大约一两秒，只在续传时发生一次。
+// 换来的是整份文件的标记口径一致。
+func seedCollector(s *sink, path string, limit int64) {
+	if path == "" || limit <= 0 {
+		return
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer fh.Close()
+
+	sc := bufio.NewScanner(io.LimitReader(fh, limit))
+	sc.Buffer(make([]byte, 0, 1<<20), 8<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var probe struct {
+			Type string  `json:"type"`
+			Root *uint64 `json:"root"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
+			continue
+		}
+		if probe.Type != "" {
+			continue
+		}
+		var cm model.Comment
+		if err := json.Unmarshal(line, &cm); err != nil {
+			continue
+		}
+		// 结果丢弃：这里要的只是让索引「见过」这些评论。
+		// 标记本身已经在上次运行时写进文件了。
+		s.ann.Observe(&cm)
+	}
+}
+
 // ---- 输出 ----
 
-// sink 是 JSONL 输出的唯一出口：它同时维护「已写入字节数」，
-// 这个计数就是续传的截断位置，所以所有写入都必须经过它。
+// outputSpec 描述一个输出目标。
+type outputSpec struct {
+	name    string
+	path    string // 空表示 stdout
+	primary bool
+}
+
+// planOutputs 决定本次要写哪些文件、写到哪里。
+//
+// 规则只有两条，但值得写清楚，因为 -o 的含义在单文件与目录两种模式下不一样：
+//
+//	-o DIR/    目录模式。默认产出 jsonl + md 与 manifest/stats/schema，
+//	           --format 给出的格式在前者基础上追加。
+//	-o FILE    单文件模式。文件格式由扩展名决定（默认 jsonl），
+//	           --format 给出的格式写成同目录同名的兄弟文件。
+//
+// 为什么多格式不能写到 stdout：两个格式抢一个流，输出就成了两种语法交错
+// 的乱码，谁都解析不了。这不是限制，是这种事本来就没有正确的做法。
+func planOutputs(out string, formats []string) (dir string, specs []outputSpec, err error) {
+	if out == "" {
+		names := formats
+		if len(names) == 0 {
+			names = []string{"jsonl"}
+		}
+		if len(names) > 1 {
+			return "", nil, usageErrorf("多种格式不能同时写到 stdout，请用 -o 指定一个目录")
+		}
+		name, cerr := canonicalFormat(names[0])
+		if cerr != nil {
+			return "", nil, cerr
+		}
+		if !output.Streaming(name) {
+			return "", nil, usageErrorf("%s 需要在内存里攒齐全部数据才能写出，"+
+				"写到 stdout 会先卡住再一次性吐出；请用 -o 指定文件或目录", name)
+		}
+		return "", []outputSpec{{name: name, primary: true}}, nil
+	}
+
+	if isDirPath(out) {
+		if len(formats) == 0 {
+			formats = output.DefaultDatasetFormats()
+		}
+		seen := map[string]bool{}
+		for _, raw := range formats {
+			name, cerr := canonicalFormat(raw)
+			if cerr != nil {
+				return "", nil, cerr
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			specs = append(specs, outputSpec{
+				name:    name,
+				path:    filepath.Join(out, "comments."+extOf(name)),
+				primary: name == "jsonl",
+			})
+		}
+		// 目录模式一定带 jsonl：它是主数据，也是 manifest 与 stats 的来源。
+		// 用户只写了 --format md 时补上它，而不是报错——他想要的显然是
+		// 「给我一份数据集」，jsonl 是数据集的一部分。
+		if !seen["jsonl"] {
+			specs = append(specs, outputSpec{
+				name: "jsonl", path: filepath.Join(out, "comments.jsonl"), primary: true,
+			})
+		}
+		return out, specs, nil
+	}
+
+	primary := output.ByExt(out)
+	if primary == "" {
+		primary = "jsonl"
+	}
+	primary, err = canonicalFormat(primary)
+	if err != nil {
+		return "", nil, err
+	}
+	if !output.Streaming(primary) {
+		return "", nil, usageErrorf(
+			"%s 需要把全部评论留在内存里才能写出，不适合作为 -o 的主输出。"+
+				"请用 -o 输出 jsonl，再加 --format json 要一份 JSON", primary)
+	}
+
+	seen := map[string]bool{primary: true}
+	specs = append(specs, outputSpec{name: primary, path: out, primary: true})
+	base := strings.TrimSuffix(out, filepath.Ext(out))
+	for _, raw := range formats {
+		name, cerr := canonicalFormat(raw)
+		if cerr != nil {
+			return "", nil, cerr
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		specs = append(specs, outputSpec{
+			name: name,
+			path: base + "." + extOf(name),
+		})
+	}
+	return "", specs, nil
+}
+
+// canonicalFormat 归一格式名并校验。
+func canonicalFormat(name string) (string, error) {
+	f, err := output.New(name)
+	if err != nil {
+		return "", usageErrorf("%v", err)
+	}
+	return f.Name(), nil
+}
+
+func extOf(name string) string {
+	f, err := output.New(name)
+	if err != nil {
+		return name
+	}
+	return f.Ext()
+}
+
+// isDirPath 判断 -o 指的是目录还是文件。
+//
+// 认三种写法：已有的目录、以路径分隔符结尾、以及指向不存在路径但带结尾
+// 分隔符的写法。不靠「有没有扩展名」来猜——`-o out` 这种名字太常见了，
+// 猜错的话用户会得到一个名叫 out 的文件而不是目录。
+func isDirPath(p string) bool {
+	if strings.HasSuffix(p, "/") || strings.HasSuffix(p, `\`) {
+		return true
+	}
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// sink 是所有输出的唯一出口。
+//
+// 它同时维护「每种格式已写入的字节数」，这个计数就是续传的截断位置，
+// 所以所有写入都必须经过它。
 type sink struct {
-	path string
-	f    *os.File // 仅在写文件时非 nil
-	bw   *bufio.Writer
-	enc  *json.Encoder
-	n    int64 // 已写入的字节数
+	dir     string // 目录模式下的数据集目录，空表示单文件或 stdout
+	primary *formatWriter
+	writers []*formatWriter
+
+	full bool
+	ann  *annotate.Collector
+
+	// journalPath 是主输出的路径，进度文件挂在它旁边。空表示这次没有
+	// 可续传的目标（写 stdout），于是所有进度相关的动作都跳过。
+	journalPath string
 
 	journal *store.Journal
 
 	// resuming 表示本次是接着已有的进度跑的，与「journal 非 nil」不是一回事：
 	// 全新抓取也会建一个 journal 用来写进度。把两者混为一谈会导致
-	// 全新抓取误以为自己在中途，从而跳过 header 行的写入。
+	// 全新抓取误以为自己在中途，从而跳过开头各行的写入。
 	resuming bool
 
 	rootExpected  int
@@ -589,64 +780,235 @@ type sink struct {
 	rootTruncated bool
 }
 
-func openSink(cmd *cobra.Command, g *globals, f commentsFlags, video *model.Video) (*sink, error) {
-	s := &sink{}
+// formatWriter 是一种格式的输出目标。
+type formatWriter struct {
+	name string
+	path string // 空表示 stdout
+	f    *os.File
+	fmt  output.Formatter
+	n    int64 // 已写入的字节数
+}
 
-	if f.out == "" {
-		s.bw = bufio.NewWriter(cmd.OutOrStdout())
-		s.enc = json.NewEncoder(s.bw)
-		return s, nil
+func (w *formatWriter) label() string {
+	if w.path == "" {
+		return w.name + "（stdout）"
 	}
+	return w.path
+}
 
-	s.path = f.out
-	if err := store.EnsureDir(f.out); err != nil {
+func openSink(cmd *cobra.Command, g *globals, f commentsFlags, video *model.Video) (*sink, error) {
+	dir, specs, err := planOutputs(f.out, f.format)
+	if err != nil {
 		return nil, err
 	}
 
+	s := &sink{
+		dir:  dir,
+		full: f.full,
+		ann:  annotate.New(video.PubTime.Time()),
+	}
+
+	// 续传的进度文件挂在主输出上。主输出在目录模式下固定是 comments.jsonl，
+	// 所以目录可以整体搬走而进度仍然有效。
+	//
+	// 必须挂主输出的**完整路径**，不能挂 f.out：目录模式下 f.out 是目录，
+	// 挂上去就成了 `<dir>/.resume.json` 这样一个藏在目录里的文件，而
+	// 读回来的地方找的是 `<dir>/comments.jsonl.resume.json`——
+	// 于是 --resume 永远找不到进度，安静地从头重抓并把半截文件截掉。
+	var primaryPath string
+	for _, sp := range specs {
+		if sp.primary {
+			primaryPath = sp.path
+		}
+	}
+	if primaryPath == "" && len(specs) == 1 {
+		primaryPath = specs[0].path
+	}
+	s.journalPath = primaryPath
+
 	if f.resume {
-		j, err := store.LoadJournal(f.out)
+		// 续传要把已有的一级评论读回来重建楼中楼计划（不然就得重抓一遍，
+		// 白花几百个请求），而只有 JSONL 能被逐行读回。TSV 读不回 user.mid，
+		// Markdown 读回正文都要靠猜标点。
+		if p := primaryFormat(specs); p != "jsonl" {
+			return nil, usageErrorf("--resume 需要 JSONL 作为主输出，而当前主格式是 %s："+
+				"续传要把已有的一级评论读回来重建楼中楼计划，而只有 JSONL 能完整读回。"+
+				"请把 -o 改成 .jsonl 文件，或用目录模式", p)
+		}
+		j, err := store.LoadJournal(primaryPath)
 		switch {
 		case errors.Is(err, store.ErrNoJournal):
 			g.logf("没有找到进度文件，将开始一次全新的抓取")
 		case err != nil:
 			return nil, err
 		default:
-			// 策略变了就换了计划，进度下标会指向另一栋楼——必须拦住，
-			// 否则续传出来的数据是错位的。
-			if j.Phase == store.PhaseReplies && j.PolicyHash != "" &&
-				j.PolicyHash != f.policy.Fingerprint() {
-				return nil, fmt.Errorf("进度文件记录的楼中楼参数与本次不一致，无法续传。"+
-					"要么用回原来的参数，要么换一个输出文件重新抓（%s）", store.JournalPath(f.out))
-			}
-			fh, err := store.TruncateOutput(f.out, j.Offset)
-			if err != nil {
+			if err := checkResumable(j, specs, f); err != nil {
 				return nil, err
 			}
-			s.f = fh
 			s.journal = j
 			s.resuming = true
-			s.n = j.Offset
-			g.logf("续传：输出已回退到第 %d 字节（丢弃上次未写完的部分）", j.Offset)
 		}
 	}
 
-	if s.f == nil {
-		fh, err := os.Create(f.out)
+	for _, sp := range specs {
+		w := &formatWriter{name: sp.name, path: sp.path}
+		w.fmt, err = output.New(sp.name)
 		if err != nil {
-			return nil, fmt.Errorf("创建 %s 失败：%w", f.out, err)
+			s.Close()
+			return nil, err
 		}
-		s.f = fh
+
+		var dst io.Writer
+		switch {
+		case sp.path == "":
+			dst = cmd.OutOrStdout()
+		case s.resuming:
+			// 截断到上次确认完整的位置：那半栋楼被干净地丢掉，
+			// 重抓不会产生重复。每种格式各自截断，因为同一批记录在
+			// 不同格式下的字节长度完全不同。
+			off := j2offset(s.journal, sp.name)
+			fh, terr := store.TruncateOutput(sp.path, off)
+			if terr != nil {
+				s.Close()
+				return nil, terr
+			}
+			w.f, w.n = fh, off
+			dst = fh
+		default:
+			if derr := store.EnsureDir(sp.path); derr != nil {
+				s.Close()
+				return nil, derr
+			}
+			fh, cerr := os.Create(sp.path)
+			if cerr != nil {
+				s.Close()
+				return nil, fmt.Errorf("创建 %s 失败：%w", sp.path, cerr)
+			}
+			w.f, dst = fh, fh
+		}
+
+		meta := &output.Meta{
+			Video:     videoRow(video, f.mode),
+			Mode:      f.mode,
+			FetchedAt: video.FetchedAt,
+			Full:      f.full,
+			Resuming:  s.resuming,
+		}
+		if berr := w.fmt.Begin(countingWriter{dst, &w.n}, meta); berr != nil {
+			s.Close()
+			return nil, fmt.Errorf("初始化 %s 输出失败：%w", w.label(), berr)
+		}
+
+		s.writers = append(s.writers, w)
+		if sp.primary {
+			s.primary = w
+		}
+	}
+	if s.primary == nil {
+		s.primary = s.writers[0]
+	}
+
+	if s.resuming {
+		g.logf("续传：各输出已回退到上次确认完整的位置（丢弃上次未写完的那部分）")
+	} else if len(specs) > 1 || s.dir != "" {
+		names := make([]string, len(s.writers))
+		for i, w := range s.writers {
+			names[i] = w.name
+		}
+		g.logf("输出格式：%s", strings.Join(names, "、"))
+	}
+
+	if s.journal == nil {
 		s.journal = &store.Journal{AID: video.AID, BVID: video.BVID}
 	}
-
-	s.bw = bufio.NewWriter(s.f)
-	s.enc = json.NewEncoder(countingWriter{s.bw, &s.n})
 	return s, nil
 }
 
+// checkResumable 拦住两类会写出错位数据的续传。
+func checkResumable(j *store.Journal, specs []outputSpec, f commentsFlags) error {
+	// 策略变了就换了计划，进度下标会指向另一栋楼。
+	if j.Phase == store.PhaseReplies && j.PolicyHash != "" &&
+		j.PolicyHash != f.policy.Fingerprint() {
+		return fmt.Errorf("进度文件记录的楼中楼参数与本次不一致，无法续传。"+
+			"要么用回原来的参数，要么换一个输出文件重新抓（%s）", store.JournalPath(j.Output))
+	}
+
+	// 格式集合变了就无法续传：进度里记的是「每种格式写到第几字节」，
+	// 集合变了这些位置就没有对应的文件了。
+	planned := make([]string, 0, len(specs))
+	for _, sp := range specs {
+		planned = append(planned, sp.name)
+	}
+	if d := store.DiffFormats(j.Formats, planned); !d.Empty() {
+		var why string
+		switch {
+		case len(d.Added) > 0 && len(d.Removed) > 0:
+			why = fmt.Sprintf("这次多了 %s、少了 %s",
+				strings.Join(d.Added, "、"), strings.Join(d.Removed, "、"))
+		case len(d.Added) > 0:
+			why = fmt.Sprintf("这次多了 %s，它没有可截断的位置，只能从头写"+
+				"，而文件里已经有别的东西了", strings.Join(d.Added, "、"))
+		default:
+			why = fmt.Sprintf("这次少了 %s，那个文件会接在半截数据后面继续写",
+				strings.Join(d.Removed, "、"))
+		}
+		return fmt.Errorf("上次抓取输出的是 %s，%s，无法续传。"+
+			"请用回原来的 --format，或换一个输出文件重新抓（%s）",
+			strings.Join(j.Formats, "、"), why, store.JournalPath(j.Output))
+	}
+	return nil
+}
+
+func j2offset(j *store.Journal, name string) int64 {
+	if j == nil || j.Offsets == nil {
+		return 0
+	}
+	return j.Offsets[name]
+}
+
+func primaryFormat(specs []outputSpec) string {
+	for _, sp := range specs {
+		if sp.primary {
+			return sp.name
+		}
+	}
+	return ""
+}
+
+// persistent 表示这次运行有进度文件可写，也就是有 -o。
+func (s *sink) persistent() bool { return s.journalPath != "" }
+
+// saveJournal 落一次进度。
+//
+// 调它之前必须先 Flush：Offset 记的是「已确认写到磁盘的字节数」，
+// 顺序反了就会记下一个比文件实际内容更靠后的位置，续传时截断出空洞——
+// 那段空洞里的数据永远不会被重抓，也不会被发现，只会安静地缺一块。
+func (s *sink) saveJournal() error {
+	if !s.persistent() {
+		return nil
+	}
+	s.recordOffsets()
+	return s.journal.Save(s.journalPath)
+}
+
+func videoRow(v *model.Video, mode string) *output.Video {
+	return &output.Video{
+		Type:      "video",
+		BVID:      v.BVID,
+		AID:       v.AID,
+		Title:     v.Title,
+		UpMid:     v.Up.Mid,
+		UpName:    v.Up.Name,
+		PubTime:   v.PubTime,
+		StatReply: v.Stat.Reply,
+		Mode:      mode,
+		FetchedAt: v.FetchedAt,
+	}
+}
+
 // countingWriter 统计写出的字节数。续传依赖它给出的位置，
-// 所以它必须包在 bufio 之外——buffer 里的内容还没落盘，不能算数，
-// Flush 之后计数才等于文件长度。
+// 所以它必须包在格式自己的缓冲之外——buffer 里的内容还没交出来，
+// 不能算数，Flush 之后计数才等于文件长度。
 type countingWriter struct {
 	w io.Writer
 	n *int64
@@ -658,88 +1020,83 @@ func (c countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *sink) writeHeader(h header) error { return s.enc.Encode(h) }
-func (s *sink) writeComment(cm *model.Comment) error {
-	return s.enc.Encode(cm)
-}
-func (s *sink) writeStub(st stub) error { return s.enc.Encode(st) }
-func (s *sink) writeSummary(sm summary) { _ = s.enc.Encode(sm) }
-
-func (s *sink) Flush() error {
-	if err := s.bw.Flush(); err != nil {
-		return err
-	}
-	if s.f != nil {
-		// 数据要真的到磁盘上，续传读到的才算数。断电时靠 fsync 保证。
-		return s.f.Sync()
+func (s *sink) write(r output.Row) error {
+	for _, w := range s.writers {
+		if err := w.fmt.Write(r); err != nil {
+			return fmt.Errorf("写入 %s 失败：%w", w.label(), err)
+		}
 	}
 	return nil
 }
 
-func (s *sink) Close() {
-	if s.f != nil {
-		s.f.Close()
+func (s *sink) writeComment(cm *model.Comment) error {
+	s.ann.Mark(cm)
+	if !s.full {
+		trimForLLM(cm)
 	}
+	return s.write(output.Row{Kind: output.KindComment, Comment: cm})
 }
 
-// ---- 输出的行结构 ----
-
-// header 是 JSONL 的第一行，把视频上下文和抓取参数一起带上，
-// 让这个文件脱离命令行也能自解释。
-type header struct {
-	Type      string     `json:"type"`
-	BVID      string     `json:"bvid"`
-	AID       int64      `json:"aid"`
-	Title     string     `json:"title"`
-	UpMid     int64      `json:"up_mid"`
-	UpName    string     `json:"up_name"`
-	PubTime   model.Time `json:"pub_time"`
-	StatReply int64      `json:"stat_reply"`
-	Mode      string     `json:"mode"`
-	FetchedAt model.Time `json:"fetched_at"`
+func (s *sink) writeStub(st *output.Stub) error {
+	return s.write(output.Row{Kind: output.KindStub, Stub: st})
 }
 
-// stub 是未展开楼的墓碑行。
+// writeSummary 收尾。它不只是「写一行」——各格式的完整度说明都在这里产出，
+// 对 TSV 和 Markdown 来说是整整一段。
+func (s *sink) writeSummary(sm *output.Summary) {
+	for _, w := range s.writers {
+		// 收尾失败也要把所有格式都试一遍：某个文件写不进去（磁盘满、
+		// 权限变了）不该让其他格式连「这次抓取不完整」都记不上。
+		_ = w.fmt.End(sm)
+	}
+	_ = s.Flush()
+}
+
+func (s *sink) Flush() error {
+	for _, w := range s.writers {
+		if err := w.fmt.Flush(); err != nil {
+			return fmt.Errorf("刷新 %s 失败：%w", w.label(), err)
+		}
+	}
+	for _, w := range s.writers {
+		if w.f != nil {
+			// 数据要真的到磁盘上，续传读到的才算数。断电时靠 fsync 保证。
+			if err := w.f.Sync(); err != nil {
+				return fmt.Errorf("同步 %s 失败：%w", w.label(), err)
+			}
+		}
+	}
+	return nil
+}
+
+// recordOffsets 把各格式当前的字节数记进进度。
 //
-// 过滤是破坏性的且对下游不可见。LLM 看到这行就知道「这楼有 37 条我没看到」，
-// 结论自然会谨慎；看不到这行则会以为评论区只有它读到的那些。
-// 成本是每楼一行。
-type stub struct {
-	Type       string `json:"type"`
-	Rpid       uint64 `json:"rpid"`
-	ReplyCount int    `json:"reply_count"`
-	Expanded   bool   `json:"expanded"`
-	Reason     string `json:"reason"`
+// 必须在 Flush 之后调用：Flush 之前这些数字还留在各格式自己的缓冲里，
+// 记下来的位置比文件实际长度靠后，续传时会截断出空洞。
+func (s *sink) recordOffsets() {
+	if s.journal == nil {
+		return
+	}
+	offs := make(map[string]int64, len(s.writers))
+	names := make([]string, 0, len(s.writers))
+	for _, w := range s.writers {
+		offs[w.name] = w.n
+		names = append(names, w.name)
+	}
+	s.journal.Offsets = offs
+	s.journal.Formats = names
 }
 
-// summary 是 JSONL 的最后一行，记录这次抓取到底拿到了多少、为什么停下。
-//
-// 这一行是整个输出的关键：下游拿到一份残缺数据却不知道它残缺，
-// 比拿不到数据更危险——基于部分评论得出的「用户普遍认为」是纯粹的幻觉。
-type summary struct {
-	Type      string        `json:"type"`
-	Expected  int           `json:"expected"`
-	Fetched   int           `json:"fetched"`
-	Pages     int           `json:"pages"`
-	Reason    string        `json:"reason"`
-	Truncated bool          `json:"truncated,omitempty"`
-	Error     string        `json:"error,omitempty"`
-	Replies   *replySummary `json:"replies,omitempty"`
-}
-
-// replySummary 是楼中楼的完整性元数据。
-//
-// 期望值与实际值分开报：Expected 是「计划展开的那些楼一共该有多少条回复」，
-// Fetched 是实际拿到的。只报 Fetched 的话，抓了一半看起来也像完整。
-type replySummary struct {
-	Expected         int            `json:"expected"`
-	Fetched          int            `json:"fetched"`
-	Expanded         int            `json:"expanded"`
-	Skipped          int            `json:"skipped,omitempty"`
-	RootsWithReplies int            `json:"roots_with_replies"`
-	OffsetLimited    int            `json:"offset_limited,omitempty"`
-	Truncated        bool           `json:"truncated,omitempty"`
-	Reasons          map[string]int `json:"skip_reasons,omitempty"`
+func (s *sink) Close() {
+	for _, w := range s.writers {
+		if w.f != nil {
+			// 先冲再关。缓冲里可能压着几千条评论，直接 Close 会把它们丢掉——
+			// 出错路径上写的那一行 summary 就是这么消失的，
+			// 而它恰恰是判断这份数据能不能用的唯一依据。
+			_ = w.fmt.Flush()
+			w.f.Close()
+		}
+	}
 }
 
 // ---- 收尾报告 ----
@@ -777,10 +1134,12 @@ func policyLabel(p bilibili.ReplyPolicy) string {
 	return out
 }
 
-func reportFetch(g *globals, out string, s *sink) {
+func reportFetch(g *globals, s *sink) {
 	where := "已输出到 stdout"
-	if out != "" {
-		where = "已写入 " + out
+	if s.dir != "" {
+		where = "已写入目录 " + s.dir
+	} else if s.primary != nil && s.primary.path != "" {
+		where = "已写入 " + s.primary.path
 	}
 
 	if s.rootStopped == bilibili.StopEnd {

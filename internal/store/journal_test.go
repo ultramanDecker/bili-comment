@@ -22,7 +22,8 @@ func TestLoadMissingJournal(t *testing.T) {
 
 func TestSaveLoadRoundTrip(t *testing.T) {
 	out := tmpOutput(t)
-	j := &Journal{AID: 123, BVID: "BV1", Phase: PhaseReplies, Offset: 4096, PlanIndex: 17}
+	j := &Journal{AID: 123, BVID: "BV1", Phase: PhaseReplies, PlanIndex: 17,
+		Primary: "jsonl", Offsets: map[string]int64{"jsonl": 4096, "md": 8192}}
 	if err := j.Save(out); err != nil {
 		t.Fatalf("保存失败：%v", err)
 	}
@@ -31,7 +32,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取失败：%v", err)
 	}
-	if got.AID != 123 || got.Phase != PhaseReplies || got.Offset != 4096 || got.PlanIndex != 17 {
+	if got.AID != 123 || got.Phase != PhaseReplies || got.Offsets["jsonl"] != 4096 || got.PlanIndex != 17 {
 		t.Errorf("读回的内容 = %+v", got)
 	}
 	if got.Version != journalVersion {
@@ -42,14 +43,13 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-// 进度文件被挪用是最危险的情况之一：把另一个输出文件的进度套上来，
-// 会按错误的偏移截断，直接毁掉已有数据。
-// 累计量必须和 Offset 一起存下来。续传时若只拿回偏移、拿不回这些数字，
+// 累计量必须和偏移一起存下来。续传时若只拿回偏移、拿不回这些数字，
 // 写出的 summary 会少报已经抓到的部分——而它看上去像个正常的完整结论。
 func TestReplyCountersRoundTrip(t *testing.T) {
 	out := tmpOutput(t)
 	j := &Journal{
-		AID: 1, Phase: PhaseReplies, Offset: 8192, PlanIndex: 2,
+		AID: 1, Phase: PhaseReplies, PlanIndex: 2,
+		Primary: "jsonl", Offsets: map[string]int64{"jsonl": 8192},
 		ReplyFetched: 2167, ReplyExpected: 6644, ReplyOffsetLimited: 1, ReplyTruncated: true,
 	}
 	if err := j.Save(out); err != nil {
@@ -69,8 +69,8 @@ func TestReplyCountersRoundTrip(t *testing.T) {
 	if got.ReplyOffsetLimited != 1 {
 		t.Errorf("超限楼数 = %d，期望 1", got.ReplyOffsetLimited)
 	}
-	if got.Offset != 8192 || got.PlanIndex != 2 {
-		t.Errorf("偏移或下标丢了：offset=%d plan_index=%d", got.Offset, got.PlanIndex)
+	if got.Offsets["jsonl"] != 8192 || got.PlanIndex != 2 {
+		t.Errorf("偏移或下标丢了：offset=%d plan_index=%d", got.Offsets["jsonl"], got.PlanIndex)
 	}
 }
 
@@ -79,7 +79,8 @@ func TestReplyCountersRoundTrip(t *testing.T) {
 // 而 PlanIndex 还是 0。按 PlanIndex 判断就会把它们再写一遍。
 func TestStubsWrittenIsIndependentOfPlanIndex(t *testing.T) {
 	out := tmpOutput(t)
-	j := &Journal{AID: 1, Phase: PhaseReplies, Offset: 6941, PlanIndex: 0, StubsWritten: true}
+	j := &Journal{AID: 1, Phase: PhaseReplies, PlanIndex: 0, StubsWritten: true,
+		Primary: "jsonl", Offsets: map[string]int64{"jsonl": 6941}}
 	if err := j.Save(out); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +115,8 @@ func TestStubsWrittenIsIndependentOfPlanIndex(t *testing.T) {
 // 变得含糊。omitempty 保证了零值不落盘。
 func TestRootsPhaseJournalOmitsReplyCounters(t *testing.T) {
 	out := tmpOutput(t)
-	j := &Journal{AID: 1, Phase: PhaseRoots, Offset: 100, RootCursor: "abc"}
+	j := &Journal{AID: 1, Phase: PhaseRoots, RootCursor: "abc",
+		Primary: "jsonl", Offsets: map[string]int64{"jsonl": 100}}
 	if err := j.Save(out); err != nil {
 		t.Fatal(err)
 	}
@@ -133,11 +135,83 @@ func TestRootsPhaseJournalOmitsReplyCounters(t *testing.T) {
 	}
 }
 
+// 同一批记录在不同格式下的字节长度不同（一条评论在 JSONL 里约 300 字节，
+// 在 TSV 里约 120），而续传要求每个文件都停在同一条记录的边界上。
+// 共用一个偏移做不到这件事，所以必须逐格式记录。
+func TestOffsetsAreTrackedPerFormat(t *testing.T) {
+	out := tmpOutput(t)
+	j := &Journal{
+		AID: 1, Phase: PhaseReplies, PlanIndex: 3,
+		Primary: "jsonl",
+		Offsets: map[string]int64{"jsonl": 4096, "tsv": 1731, "md": 2202},
+		Formats: []string{"jsonl", "tsv", "md"},
+	}
+	if err := j.Save(out); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadJournal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int64{"jsonl": 4096, "tsv": 1731, "md": 2202} {
+		if got.Offsets[name] != want {
+			t.Errorf("%s 的偏移 = %d，期望 %d", name, got.Offsets[name], want)
+		}
+	}
+	if len(got.Formats) != 3 || got.Formats[0] != "jsonl" {
+		t.Errorf("格式列表 = %v，期望 [jsonl tsv md]", got.Formats)
+	}
+	if got.Primary != "jsonl" {
+		t.Errorf("主格式 = %q，期望 jsonl", got.Primary)
+	}
+	// 格式集合变了，Offsets 里的位置就找不到对应的文件了，续传必须被拒。
+	if d := DiffFormats(got.Formats, got.Formats); !d.Empty() {
+		t.Errorf("同一个集合却报出差异：%+v", d)
+	}
+	if d := DiffFormats(got.Formats, []string{"jsonl", "tsv"}); d.Empty() {
+		t.Error("格式集合不同却判为一致，续传会按错误的偏移截断")
+	} else if len(d.Removed) != 1 || d.Removed[0] != "md" || len(d.Added) != 0 {
+		t.Errorf("差异 = %+v，期望只少了 md", d)
+	}
+}
+
+// 少一个格式会让那个文件从头开始写却接在半截数据后面；多一个格式则没有位置
+// 可截断。两个方向都必须被认出来，而且不能混为一谈。
+func TestDiffFormatsDirection(t *testing.T) {
+	// 多了：本次要写 tsv，上次没写。
+	d := DiffFormats([]string{"jsonl"}, []string{"jsonl", "tsv"})
+	if len(d.Added) != 1 || d.Added[0] != "tsv" || len(d.Removed) != 0 {
+		t.Errorf("差异 = %+v，期望只多了 tsv", d)
+	}
+	// 少了：上次写了 tsv，本次不写。
+	d = DiffFormats([]string{"jsonl", "tsv"}, []string{"jsonl"})
+	if len(d.Removed) != 1 || d.Removed[0] != "tsv" || len(d.Added) != 0 {
+		t.Errorf("差异 = %+v，期望只少了 tsv", d)
+	}
+	// 两边都有：换了一整套格式。
+	d = DiffFormats([]string{"jsonl", "tsv"}, []string{"jsonl", "md"})
+	if len(d.Added) != 1 || len(d.Removed) != 1 {
+		t.Errorf("差异 = %+v，期望一增一减", d)
+	}
+	// 顺序不同不算差异：用户把 --format 写反了不该导致无法续传。
+	if d := DiffFormats([]string{"jsonl", "md"}, []string{"md", "jsonl"}); !d.Empty() {
+		t.Errorf("只有顺序不同却报出差异：%+v", d)
+	}
+	// 早期版本的进度文件没有格式记录，必须按现状接受——
+	// 否则所有老进度文件都会突然无法续传。
+	if d := DiffFormats(nil, []string{"jsonl", "tsv"}); !d.Empty() {
+		t.Errorf("没有格式记录时不该报差异：%+v", d)
+	}
+}
+
+// 进度文件被挪用是最危险的情况之一：把另一个输出文件的进度套上来，
+// 会按错误的偏移截断，直接毁掉已有数据。
 func TestLoadRejectsForeignJournal(t *testing.T) {
 	a := filepath.Join(t.TempDir(), "a.jsonl")
 	b := filepath.Join(t.TempDir(), "b.jsonl")
 
-	j := &Journal{AID: 1, Offset: 100}
+	j := &Journal{AID: 1, Primary: "jsonl", Offsets: map[string]int64{"jsonl": 100}}
 	if err := j.Save(a); err != nil {
 		t.Fatal(err)
 	}

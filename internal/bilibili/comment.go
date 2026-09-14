@@ -315,7 +315,7 @@ func (r *apiReply) toModel() *model.Comment {
 		Rpid:       r.Rpid,
 		Root:       r.Root,
 		Parent:     r.Parent,
-		Message:    r.Content.Message,
+		Message:    cleanMessage(r.Content.Message),
 		Like:       r.Like,
 		Ctime:      model.Time(time.Unix(r.Ctime, 0)),
 		ReplyCount: replyCount,
@@ -348,6 +348,67 @@ func (r *apiReply) toModel() *model.Comment {
 		}
 	}
 	return cm
+}
+
+// cleanMessage 把正文里的排版标记还原成真正的换行。
+//
+// B 站的正文用两种写法表示换行：老评论里是真正的 \n，新评论里是字面量
+// `<br />`。不统一的话，同一个字段的含义会随评论的年龄而变——老评论里
+// 换行是换行，新评论里换行是六个字符的标签，而下游（尤其是 LLM）会把
+// 它当成正文的一部分读出来。实测一个只有十条评论的样本里就有三条带这个
+// 标签，比例不低。
+//
+// 只处理换行标记，不做通用的 HTML 清洗：正文里的 `<` `>` 大多是「大于号」
+// 「箭头」这类正常内容（「笑死 >_<」），把它们当标签删掉是改数据。
+// 换行标记是唯一一个「平台用它表达排版、而非用户写下的内容」的构造。
+func cleanMessage(s string) string {
+	// 绝大多数评论里没有尖括号，先挡掉，免得每条都分配一个 Builder。
+	if strings.IndexByte(s, '<') < 0 {
+		return s
+	}
+
+	// 逐段扫描而不是一次性 ReplaceAll：标签的写法有 <br>、<br/>、<br />
+	// 三种，大小写也不保证一致，而 ReplaceAll 要求先枚举出全部写法。
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '<' {
+			if n := brTagLen(s[i:]); n > 0 {
+				b.WriteByte('\n')
+				i += n
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// brTagLen 判断 s 是否以 <br> 形式的标签开头，是则返回它的字节长度。
+//
+// 只认这一种标记，不做通用 HTML 解析：这里要的是「认识 B 站用来表达换行的
+// 那一个构造」，而不是一个解析器。写成通用解析就会开始吞掉用户真正写下的
+// 尖括号——「笑死 >_<」和「x < y」都是正常的正文。
+func brTagLen(s string) int {
+	if len(s) < 4 || !strings.EqualFold(s[:3], "<br") {
+		return 0
+	}
+	i := 3
+	skipSpace := func() {
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+	}
+	skipSpace()
+	if i < len(s) && s[i] == '/' {
+		i++
+		skipSpace()
+	}
+	if i < len(s) && s[i] == '>' {
+		return i + 1
+	}
+	return 0
 }
 
 // flexID 兼容同一个接口里 ID 时而字符串时而数字的写法。

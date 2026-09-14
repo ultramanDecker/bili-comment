@@ -442,3 +442,48 @@ func TestCommentOmitsZeroRootInJSON(t *testing.T) {
 		t.Errorf("rpid 必须出现：%s", b)
 	}
 }
+
+// B 站的正文用两种写法表示换行：老评论里是真正的 \n，新评论里是字面量
+// `<br />`。不统一的话同一个字段的含义会随评论的年龄而变——老评论里换行
+// 是换行，新评论里换行是六个字符的标签，而下游（尤其是 LLM）会把它当成
+// 正文的一部分读出来。
+func TestCleanMessageNormalizesBrTags(t *testing.T) {
+	cases := map[string]string{
+		"111111<br />22222": "111111\n22222",
+		"a<br>b":            "a\nb",
+		"a<br/>b":           "a\nb",
+		"a<br  />b":         "a\nb",
+		"a<BR />b":          "a\nb",
+		"a<br\n>b":          "a<br\n>b", // 标签里不能有换行，不是标签
+		"第一行\n第二行":          "第一行\n第二行", // 已经是真换行的原样保留
+		"笑死 >_<":            "笑死 >_<",
+		"x < y 且 y > z":     "x < y 且 y > z",
+		"<b>粗体</b>":         "<b>粗体</b>", // 只认换行标记，不做通用清洗
+		"a<brb":             "a<brb",
+		"结尾的 <br":           "结尾的 <br",
+		"":                  "",
+		"<br />":            "\n",
+		"<br /><br />":      "\n\n",
+		"上<br />中<br />下":   "上\n中\n下",
+		"[doge]<br />[大哭]":  "[doge]\n[大哭]",
+	}
+	for in, want := range cases {
+		if got := cleanMessage(in); got != want {
+			t.Errorf("cleanMessage(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+// 换行统一之后，同一条评论在模型里只有一种写法，下游不必分别处理。
+func TestToModelCleansMessage(t *testing.T) {
+	var r apiReply
+	const raw = `{"rpid":1,"content":{"message":"第一首:abc<br />第二首:def<br />第三首:ghi"}}`
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		t.Fatal(err)
+	}
+	got := r.toModel().Message
+	want := "第一首:abc\n第二首:def\n第三首:ghi"
+	if got != want {
+		t.Errorf("Message = %q，期望 %q", got, want)
+	}
+}
