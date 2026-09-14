@@ -13,12 +13,13 @@ import (
 type Kind int
 
 const (
-	KindUnknown   Kind = iota
-	KindSignature      // 签名失效，刷新密钥后可重试
-	KindRateLimit      // 触发风控，退避后可重试
-	KindNeedLogin      // 需要登录
-	KindNoComment      // 评论区不可用
-	KindNotFound       // 视频不存在
+	KindUnknown    Kind = iota
+	KindSignature       // 签名失效，刷新密钥后可重试
+	KindRateLimit       // 触发风控，退避后可重试
+	KindNeedLogin       // 需要登录
+	KindNoComment       // 评论区不可用
+	KindNotFound        // 视频不存在
+	KindRangeLimit      // 翻页超出服务端上限，重试无用
 )
 
 // APIError 是带平台错误码的响应错误。
@@ -42,9 +43,16 @@ func (e *APIError) Retryable() bool {
 	return e.Kind == KindSignature || e.Kind == KindRateLimit
 }
 
+// IsRangeLimit 判断错误是否为「翻页超出上限」。
+// 分页循环用它区分「真的出错了」和「服务端就只给到这里」——
+// 后者是正常的停止条件，要如实记进完整性元数据，而不是当失败上报。
+func IsRangeLimit(err error) bool { return KindOf(err) == KindRangeLimit }
+
 // codeHint 给出错误码的可读解释与建议动作。
 func codeHint(code int) string {
 	switch code {
+	case -400:
+		return "请求参数有误或翻页超出服务端上限（max offset exceeded），重试无效"
 	case -403:
 		return "签名校验失败，可能需要刷新 WBI 密钥"
 	case -352:
@@ -86,6 +94,10 @@ func classify(code int) Kind {
 		return KindNotFound
 	case 12002:
 		return KindNoComment
+	case -400:
+		// 参数错误。实测翻页超出上限时报的就是这个码（max offset exceeded）——
+		// 重试不可能成功，还会白等两次退避并多打三次请求撞限速器。
+		return KindRangeLimit
 	}
 	if code < 0 {
 		// 未列出的负数码几乎都是风控，宁可当风控处理（退避重试）也不要直接失败。

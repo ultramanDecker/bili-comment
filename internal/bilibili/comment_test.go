@@ -45,7 +45,7 @@ func run(t *testing.T, pages []*CommentPage, opt FetchOptions) (*FetchResult, []
 	t.Helper()
 	f := &fakePages{pages: pages}
 	var got []uint64
-	res, err := fetchPages(context.Background(), opt, f.fetch, func(page []*model.Comment) error {
+	res, err := fetchPages(context.Background(), opt, "", f.fetch, func(page []*model.Comment, _ Cursor) error {
 		for _, cm := range page {
 			got = append(got, cm.Rpid)
 		}
@@ -93,8 +93,8 @@ func TestFetchPagesPassesCursor(t *testing.T) {
 		{Comments: []*model.Comment{mkComment(2, 90)}, Cursor: Cursor{IsEnd: true}},
 	}}
 	var got []uint64
-	_, err := fetchPages(context.Background(), FetchOptions{AID: 1}, f.fetch,
-		func(page []*model.Comment) error {
+	_, err := fetchPages(context.Background(), FetchOptions{AID: 1}, "", f.fetch,
+		func(page []*model.Comment, _ Cursor) error {
 			for _, cm := range page {
 				got = append(got, cm.Rpid)
 			}
@@ -151,8 +151,8 @@ func TestFetchPagesLimitOnPageBoundary(t *testing.T) {
 			Cursor: Cursor{AllCount: 100, NextOffset: "B"}},
 	}}
 	var got []uint64
-	res, err := fetchPages(context.Background(), FetchOptions{AID: 1, Limit: 2}, f.fetch,
-		func(page []*model.Comment) error {
+	res, err := fetchPages(context.Background(), FetchOptions{AID: 1, Limit: 2}, "", f.fetch,
+		func(page []*model.Comment, _ Cursor) error {
 			for _, cm := range page {
 				got = append(got, cm.Rpid)
 			}
@@ -207,7 +207,7 @@ func TestFetchPagesStopsOnStuckCursor(t *testing.T) {
 		{Comments: []*model.Comment{mkComment(2, 90)}, Cursor: Cursor{AllCount: 10, NextOffset: "A"}},
 	}}
 
-	res, err := fetchPages(context.Background(), FetchOptions{AID: 1}, f.fetch, func([]*model.Comment) error { return nil })
+	res, err := fetchPages(context.Background(), FetchOptions{AID: 1}, "", f.fetch, func([]*model.Comment, Cursor) error { return nil })
 	if err != nil {
 		t.Fatalf("失败：%v", err)
 	}
@@ -228,13 +228,13 @@ func TestFetchPagesReportsPartialOnError(t *testing.T) {
 		err: errors.New("网络断了"),
 	}
 	var got []uint64
-	res, err := fetchPages(context.Background(), FetchOptions{AID: 1}, func(ctx context.Context, offset string) (*CommentPage, error) {
+	res, err := fetchPages(context.Background(), FetchOptions{AID: 1}, "", func(ctx context.Context, offset string) (*CommentPage, error) {
 		// 第一页正常返回，之后报错。
 		if len(got) == 0 {
 			return f.pages[0], nil
 		}
 		return nil, f.err
-	}, func(page []*model.Comment) error {
+	}, func(page []*model.Comment, _ Cursor) error {
 		for _, cm := range page {
 			got = append(got, cm.Rpid)
 		}
@@ -258,8 +258,8 @@ func TestFetchPagesStopsOnCallbackError(t *testing.T) {
 		{Comments: []*model.Comment{mkComment(2, 90)}, Cursor: Cursor{AllCount: 10, NextOffset: "B"}},
 	}}
 	boom := errors.New("写盘失败")
-	_, err := fetchPages(context.Background(), FetchOptions{AID: 1}, f.fetch,
-		func([]*model.Comment) error { return boom })
+	_, err := fetchPages(context.Background(), FetchOptions{AID: 1}, "", f.fetch,
+		func([]*model.Comment, Cursor) error { return boom })
 	if !errors.Is(err, boom) {
 		t.Fatalf("应当把回调的错误原样返回，实际 %v", err)
 	}
@@ -280,8 +280,8 @@ func TestFetchPagesMarksUpComments(t *testing.T) {
 	}
 	f := &fakePages{pages: pages}
 	var seen []*model.Comment
-	if _, err := fetchPages(context.Background(), FetchOptions{AID: 1, UpMid: 42}, f.fetch,
-		func(page []*model.Comment) error {
+	if _, err := fetchPages(context.Background(), FetchOptions{AID: 1, UpMid: 42}, "", f.fetch,
+		func(page []*model.Comment, _ Cursor) error {
 			seen = append(seen, page...)
 			return nil
 		}); err != nil {

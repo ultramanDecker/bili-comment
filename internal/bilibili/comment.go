@@ -50,6 +50,7 @@ const (
 	StopLimit       StopReason = "limit"        // 达到 --limit
 	StopSince       StopReason = "since"        // 早于 --since 截止时间
 	StopCursorStuck StopReason = "cursor_stuck" // 游标不再前进，继续翻会死循环
+	StopOffsetLimit StopReason = "offset_limit" // 翻页超出服务端的 offset 上限（实测 5000）
 )
 
 // CommentPage 是一页一级评论。
@@ -94,6 +95,17 @@ type pageFetcher func(ctx context.Context, offset string) (*CommentPage, error)
 // 而且抓取要跑几十分钟，中途断掉是常态。逐页交给调用方，调用方才能立刻落盘，
 // 断掉时已抓到的部分依然可用。
 func (c *Client) FetchComments(ctx context.Context, opt FetchOptions, onPage func([]*model.Comment) error) (*FetchResult, error) {
+	return c.FetchCommentsFrom(ctx, opt, "", func(page []*model.Comment, _ Cursor) error {
+		return onPage(page)
+	})
+}
+
+// FetchCommentsFrom 与 FetchComments 相同，但从指定游标开始，并把每页之后的
+// 游标一并交给回调。
+//
+// 续传需要它：一级评论阶段中断后，进度文件里存着中断时的游标，
+// 下次接着翻即可，不必把已经抓到的几千条重抓一遍。
+func (c *Client) FetchCommentsFrom(ctx context.Context, opt FetchOptions, startOffset string, onPage func([]*model.Comment, Cursor) error) (*FetchResult, error) {
 	if opt.AID <= 0 {
 		return nil, fmt.Errorf("无效的 aid：%d", opt.AID)
 	}
@@ -101,14 +113,14 @@ func (c *Client) FetchComments(ctx context.Context, opt FetchOptions, onPage fun
 	if mode != ModeTime {
 		mode = ModeHot
 	}
-	return fetchPages(ctx, opt, func(ctx context.Context, offset string) (*CommentPage, error) {
+	return fetchPages(ctx, opt, startOffset, func(ctx context.Context, offset string) (*CommentPage, error) {
 		return c.commentPage(ctx, opt.AID, mode, offset)
 	}, onPage)
 }
 
-func fetchPages(ctx context.Context, opt FetchOptions, fetch pageFetcher, onPage func([]*model.Comment) error) (*FetchResult, error) {
+func fetchPages(ctx context.Context, opt FetchOptions, startOffset string, fetch pageFetcher, onPage func([]*model.Comment, Cursor) error) (*FetchResult, error) {
 	res := &FetchResult{Stopped: StopEnd}
-	offset := ""
+	offset := startOffset
 
 	for page := 1; ; page++ {
 		// limit 在请求之前判断，避免为了凑数多抓一整页。
@@ -154,7 +166,7 @@ func fetchPages(ctx context.Context, opt FetchOptions, fetch pageFetcher, onPage
 		}
 
 		if len(comments) > 0 {
-			if err := onPage(comments); err != nil {
+			if err := onPage(comments, cp.Cursor); err != nil {
 				return res, err
 			}
 			res.Fetched += len(comments)

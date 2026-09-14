@@ -429,3 +429,10 @@ func (l *limiter) Wait(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+// Delay 返回当前的请求间隔，供上层估算耗时。
+func (c *Client) Delay() time.Duration {
+	c.limiter.mu.Lock()
+	defer c.limiter.mu.Unlock()
+	return c.limiter.interval
+}
